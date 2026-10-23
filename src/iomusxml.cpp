@@ -935,6 +935,7 @@ bool MusicXmlInput::HasAlignedMeasureStarts(pugi::xml_node root) const
     };
 
     std::vector<std::pair<int, int>> reference;
+    std::vector<std::string> referenceNumbers;
     bool firstPart = true;
     for (pugi::xml_node part : root.children("part")) {
         int divisions = 0;
@@ -967,9 +968,13 @@ bool MusicXmlInput::HasAlignedMeasureStarts(pugi::xml_node root) const
             if (duration == 0) return false;
             if (firstPart) {
                 reference.emplace_back(duration, divisions);
+                referenceNumbers.emplace_back(measure.attribute("number").as_string());
             }
             else {
                 if (index >= reference.size()) return false;
+                // AddMeasure also uses the original measure number when merging
+                // staff content; aligned time alone is not enough for that path.
+                if (referenceNumbers[index] != measure.attribute("number").as_string()) return false;
                 // Only elapsed spans before a following barline determine start
                 // alignment. A final overfull bar need not have equal part lengths.
                 if (measure.next_sibling("measure")) {

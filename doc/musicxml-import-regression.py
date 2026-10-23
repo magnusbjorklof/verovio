@@ -140,6 +140,10 @@ class DirectImportTests(unittest.TestCase):
         self.run_score(score(bar(1,attrs()+note("a"))+bar(2,note("b")),
             bar(1,attrs()+note("c",duration=2),True)+bar(2,note("d"),True)),False)
 
+    def test_mismatched_bar_numbers_cannot_silently_drop_a_part(self):
+        self.run_score(score(bar(1,attrs()+note("a"))+bar(2,note("b")),
+            bar(7,attrs()+note("c"),True)+bar(8,note("d"),True)),False)
+
     def test_backup_voices_and_chords_do_not_double_measure_duration(self):
         chord=note("chord","G").replace('<pitch>','<chord/><pitch>')
         self.run_score(score(bar(1,attrs()+note("a"))+bar(2,note("b")),
