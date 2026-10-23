@@ -10,6 +10,9 @@
 //----------------------------------------------------------------------------
 
 #include <cassert>
+#include <charconv>
+#include <exception>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -128,12 +131,24 @@ bool MusicXmlInput::Import(const std::string &musicxml)
         m_doc->Reset();
         m_doc->SetType(Raw);
         pugi::xml_document xmlDoc;
-        xmlDoc.load_string(musicxml.c_str());
-        pugi::xml_node root = xmlDoc.first_child();
-        return ReadMusicXml(root);
+        const pugi::xml_parse_result result = xmlDoc.load_string(musicxml.c_str());
+        if (!result) {
+            LogError("MusicXML import: %s", result.description());
+            return false;
+        }
+        pugi::xml_node root = xmlDoc.document_element();
+        if (!IsElement(root, "score-partwise")) {
+            LogError("MusicXML import: Expected a score-partwise document.");
+            return false;
+        }
+        return this->ReadMusicXml(root);
     }
     catch (char *str) {
         LogError("%s", str);
+        return false;
+    }
+    catch (const std::exception &error) {
+        LogError("MusicXML import: %s", error.what());
         return false;
     }
 }
@@ -902,15 +917,89 @@ void MusicXmlInput::PrintMetronome(pugi::xml_node metronome, Tempo *tempo)
 //////////////////////////////////////////////////////////////////////////////
 // Parsing methods
 
+bool MusicXmlInput::HasAlignedMeasureStarts(pugi::xml_node root) const
+{
+    // Keep the proof deliberately conservative: integral divisions/durations,
+    // explicit elapsed time, and no divisions changes inside a measure. This is
+    // the subset handled by the existing integer-tick importer. Unsupported or
+    // ambiguous timing must return false rather than silently shift another part.
+    const auto readPositiveInt = [](pugi::xml_node node, int &value) {
+        const std::string text = node.text().as_string();
+        const size_t first = text.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return false;
+        const size_t last = text.find_last_not_of(" \t\r\n") + 1;
+        const char *begin = text.data() + first;
+        const char *end = text.data() + last;
+        const std::from_chars_result result = std::from_chars(begin, end, value);
+        return result.ec == std::errc() && result.ptr == end && value > 0;
+    };
+
+    std::vector<std::pair<int, int>> reference;
+    bool firstPart = true;
+    for (pugi::xml_node part : root.children("part")) {
+        int divisions = 0;
+        size_t index = 0;
+        for (pugi::xml_node measure : part.children("measure")) {
+            long long cursor = 0;
+            int duration = 0;
+            for (pugi::xml_node child : measure.children()) {
+                if (IsElement(child, "attributes")) {
+                    const pugi::xml_node xmlDivisions = child.child("divisions");
+                    if (xmlDivisions) {
+                        int nextDivisions = 0;
+                        if (!readPositiveInt(xmlDivisions, nextDivisions)) return false;
+                        if (duration > 0 && nextDivisions != divisions) return false;
+                        divisions = nextDivisions;
+                    }
+                }
+                else if (IsElement(child, "note") || IsElement(child, "forward") || IsElement(child, "backup")) {
+                    if (child.child("grace")) continue;
+                    int ticks = 0;
+                    if (divisions == 0 || !readPositiveInt(child.child("duration"), ticks)) return false;
+                    // Chord tones share the preceding note's time; backup selects
+                    // another voice. Neither may add a second measure's duration.
+                    if (child.child("chord")) continue;
+                    cursor += IsElement(child, "backup") ? -static_cast<long long>(ticks) : ticks;
+                    if (cursor < 0 || cursor > std::numeric_limits<int>::max()) return false;
+                    duration = std::max(duration, static_cast<int>(cursor));
+                }
+            }
+            if (duration == 0) return false;
+            if (firstPart) {
+                reference.emplace_back(duration, divisions);
+            }
+            else {
+                if (index >= reference.size()) return false;
+                // Only elapsed spans before a following barline determine start
+                // alignment. A final overfull bar need not have equal part lengths.
+                if (measure.next_sibling("measure")) {
+                    const std::pair<int, int> &expected = reference[index];
+                    if (static_cast<long long>(duration) * expected.second
+                        != static_cast<long long>(expected.first) * divisions) {
+                        return false;
+                    }
+                }
+            }
+            ++index;
+        }
+        if (index != reference.size() || index == 0) return false;
+        firstPart = false;
+    }
+    return !firstPart;
+}
+
 bool MusicXmlInput::ReadMusicXml(pugi::xml_node root)
 {
     assert(root);
 
-    // check for multimetric music
-    bool multiMetric = root.select_node("/score-partwise/part/measure[@non-controlling='yes']");
-    if (multiMetric) {
-        LogError("MusicXML import: Multimetric music detected. Import cancelled.");
-        exit(1);
+    // Parts are merged by measure index below. Some exporters mark synchronized,
+    // forward-only measures as non-controlling. Accept them only when their
+    // encoded timing proves that the measure starts still coincide in all parts.
+    // Truly independent barlines need a different mapping, not removal of the flag.
+    const bool nonControlling = root.select_node("part/measure[@non-controlling='yes']");
+    if (nonControlling && !this->HasAlignedMeasureStarts(root)) {
+        LogError("MusicXML import: Independent measure alignment is not supported. Import cancelled.");
+        return false;
     }
 
     this->ReadMusicXmlTitle(root);
@@ -1896,6 +1985,46 @@ bool MusicXmlInput::ReadMusicXmlPart(pugi::xml_node node, Section *section, shor
     return false;
 }
 
+bool MusicXmlInput::CanCollapseMultiRest(pugi::xml_node measure, int count) const
+{
+    if (count < 1) return false;
+    int index = 0;
+    for (pugi::xml_node previous = measure.previous_sibling("measure"); previous;
+        previous = previous.previous_sibling("measure")) {
+        ++index;
+    }
+    // MEI multiRest spans the entire score. A part-local display abbreviation
+    // must never suppress another part's notes or lengthen its elapsed time.
+    for (pugi::xml_node part : measure.parent().parent().children("part")) {
+        pugi::xml_node first = part.child("measure");
+        for (int i = 0; i < index && first; ++i) first = first.next_sibling("measure");
+        if (!first) return false;
+        const pugi::xpath_node abbreviation
+            = first.select_node("attributes/measure-style/multiple-rest | mei-read/measure-style/multiple-rest");
+        if (abbreviation.node().text().as_int() != count) return false;
+        pugi::xml_node current = first;
+        for (int i = 0; i < count; ++i) {
+            if (!current) return false;
+            bool hasRest = false;
+            for (pugi::xml_node child : current.children()) {
+                if (IsElement(child, "note")) {
+                    if (!child.child("rest")) return false;
+                    hasRest = true;
+                }
+                else if (!IsElement(child, "barline") && !IsElement(child, "print")
+                    && !(i == 0 && (IsElement(child, "attributes") || IsElement(child, "mei-read")))) {
+                    // Do not discard time/key changes, navigation or directions
+                    // hidden inside the abbreviated span.
+                    return false;
+                }
+            }
+            if (!hasRest) return false;
+            current = current.next_sibling("measure");
+        }
+    }
+    return true;
+}
+
 bool MusicXmlInput::ReadMusicXmlMeasure(
     pugi::xml_node node, Section *section, Measure *measure, short int nbStaves, const short int staffOffset, int index)
 {
@@ -1947,6 +2076,10 @@ bool MusicXmlInput::ReadMusicXmlMeasure(
         if (child.select_node(".//multiple-rest")) {
             const pugi::xml_node multiRestNode = child.select_node(".//multiple-rest").node();
             const int multiRestLength = multiRestNode.text().as_int();
+            if (!this->CanCollapseMultiRest(node, multiRestLength)) {
+                if (IsElement(child, "attributes")) this->ReadMusicXmlAttributes(child, section, measure);
+                continue;
+            }
             const std::string symbols = multiRestNode.attribute("use-symbols").as_string();
             MultiRest *multiRest = new MultiRest;
             if (symbols == "no") {
@@ -2647,7 +2780,7 @@ void MusicXmlInput::ReadMusicXmlDirection(
     // Ottava
     pugi::xml_node xmlShift = typeNode.child("octave-shift");
     if (xmlShift) {
-        const short int staffNum = (!staffNode) ? 1 : staffNode.text().as_int() + staffOffset;
+        const short int staffNum = (staffNode ? staffNode.text().as_int() : 1) + staffOffset;
         if (HasAttributeWithValue(xmlShift, "type", "stop")) {
             m_octDis[staffNum] = 0;
             for (auto iter = m_controlElements.begin(); iter != m_controlElements.end(); ++iter) {

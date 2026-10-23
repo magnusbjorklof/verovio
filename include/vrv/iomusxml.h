@@ -329,6 +329,8 @@ private:
     /*
      * Top level method called from ImportFile or Import
      */
+    bool CanCollapseMultiRest(pugi::xml_node measure, int count) const;
+    bool HasAlignedMeasureStarts(pugi::xml_node root) const;
     bool ReadMusicXml(pugi::xml_node root);
 
     /*
