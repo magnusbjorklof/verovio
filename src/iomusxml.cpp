@@ -1470,7 +1470,24 @@ void MusicXmlInput::CreateExpansion(Section *section)
             int times = (jumpBack && !iter->first.m_repeatInfo.m_afterJump) ? 1 : iter->first.m_repeatInfo.m_times;
             for (int t = 2; t <= times; ++t) {
                 for (auto it = rptIter; it != std::next(iter); ++it) {
-                    std::string ref = "#" + it->first.m_target->GetID();
+                    // A later backward repeat can return across endings already
+                    // expanded above. Replay only their final pass, not each
+                    // alternative consecutively (e.g. both first and second).
+                    decltype(it) target = it;
+                    if (it->first.m_classId == ENDING) {
+                        int finalNumber = 0;
+                        while (it != std::next(iter) && it->first.m_classId == ENDING) {
+                            for (int number : parseInts(it->first.m_endingInfo.m_number)) {
+                                if (number > finalNumber) {
+                                    finalNumber = number;
+                                    target = it;
+                                }
+                            }
+                            ++it;
+                        }
+                        --it;
+                    }
+                    std::string ref = "#" + target->first.m_target->GetID();
                     expansion->GetPlistInterface()->AddRefAllowDuplicate(ref);
                 }
             }
